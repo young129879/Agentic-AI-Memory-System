@@ -53,6 +53,8 @@ def create_app(db_path: Optional[str] = None,
                context_ttl: int = 3600,
                upstream_url: Optional[str] = None,
                upstream_key: Optional[str] = None,
+               openai_upstream_url: Optional[str] = None,
+               openai_upstream_key: Optional[str] = None,
                bridge_url: Optional[str] = None,
                injection_ttl: int = 7200) -> FastAPI:
 
@@ -76,7 +78,7 @@ def create_app(db_path: Optional[str] = None,
         yield
         # Streamed turns are persisted after the response is delivered, so a
         # write can still be in flight when shutdown begins.
-        from .anthropic_handler import flush_pending_writes
+        from .llm_handler import flush_pending_writes
         flushed = await flush_pending_writes(timeout=10.0)
         if flushed:
             logger.info(f"Flushed {flushed} pending memory writes")
@@ -180,20 +182,36 @@ def create_app(db_path: Optional[str] = None,
 
     app.include_router(create_bridge_router(get_service))
 
-    # Anthropic-compatible proxy. Mounted only when an upstream is configured,
-    # so the service can also run as memory-only with no LLM credentials.
-    resolved_upstream = upstream_url or os.getenv("HMLR_UPSTREAM_URL")
-    if resolved_upstream:
-        from .anthropic_handler import create_router
+    # LLM proxies. Mounted only when an upstream is configured, so the
+    # service can also run as memory-only with no LLM credentials.
+    #
+    # Both protocols may run at once against different upstreams: an agent
+    # speaking Anthropic and one speaking OpenAI can share a memory store.
+    from .llm_handler import ANTHROPIC, OPENAI, create_router
 
+    anthropic_upstream = upstream_url or os.getenv("HMLR_UPSTREAM_URL")
+    if anthropic_upstream:
         app.include_router(create_router(
             get_service=get_service,
-            upstream_url=resolved_upstream,
+            upstream_url=anthropic_upstream,
             upstream_key=upstream_key or os.getenv("ANTHROPIC_API_KEY"),
             bridge_url=bridge_url,
             injection_cache=injection_cache,
+            protocol=ANTHROPIC,
         ))
-        logger.info(f"Anthropic proxy enabled -> {resolved_upstream}")
+        logger.info(f"Anthropic proxy enabled -> {anthropic_upstream}")
+
+    openai_upstream = openai_upstream_url or os.getenv("HMLR_OPENAI_UPSTREAM_URL")
+    if openai_upstream:
+        app.include_router(create_router(
+            get_service=get_service,
+            upstream_url=openai_upstream,
+            upstream_key=openai_upstream_key or os.getenv("OPENAI_API_KEY"),
+            bridge_url=bridge_url,
+            injection_cache=injection_cache,
+            protocol=OPENAI,
+        ))
+        logger.info(f"OpenAI proxy enabled -> {openai_upstream}")
 
     return app
 
@@ -213,10 +231,16 @@ def main() -> None:
                         help="SQLite path (default: HMLR's own default)")
     parser.add_argument("--upstream",
                         default=os.getenv("HMLR_UPSTREAM_URL"),
-                        help="Anthropic base URL; enables the proxy endpoint. "
+                        help="Anthropic base URL; enables POST /v1/messages. "
                              "e.g. https://api.anthropic.com")
     parser.add_argument("--upstream-key", default=os.getenv("ANTHROPIC_API_KEY"),
                         help="Key sent upstream. Omit to pass the client's own through.")
+    parser.add_argument("--openai-upstream",
+                        default=os.getenv("HMLR_OPENAI_UPSTREAM_URL"),
+                        help="OpenAI-compatible base URL; enables "
+                             "POST /v1/chat/completions. e.g. https://api.openai.com")
+    parser.add_argument("--openai-upstream-key", default=os.getenv("OPENAI_API_KEY"),
+                        help="Key sent to the OpenAI-compatible upstream.")
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
 
@@ -231,6 +255,8 @@ def main() -> None:
         create_app(db_path=args.db,
                    upstream_url=args.upstream,
                    upstream_key=args.upstream_key,
+                   openai_upstream_url=args.openai_upstream,
+                   openai_upstream_key=args.openai_upstream_key,
                    bridge_url=bridge),
         host=args.host,
         port=args.port,

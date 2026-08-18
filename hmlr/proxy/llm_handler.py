@@ -1,9 +1,14 @@
 """
-Anthropic Messages endpoint.
+LLM proxy endpoints.
 
-Sits between an agent and api.anthropic.com. Per turn:
+Sits between an agent and its model provider. Per turn:
 
     recall memory -> append to system -> forward -> stream back -> ingest
+
+Two protocols, one pipeline. Anthropic Messages and OpenAI Chat Completions
+differ only in where the system prompt lives and how SSE deltas are shaped,
+so those differences are isolated in protocol adapters and the flow below is
+written once.
 
 Two rules shape the whole file:
 
@@ -17,8 +22,9 @@ after the response is fully delivered, off the request path.
 """
 
 import asyncio
+import json
 import logging
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import httpx
 from fastapi import APIRouter, Request
@@ -27,7 +33,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .injection import build_memory_block
 from .injection_cache import InjectionCache
 from .protocol import anthropic as ap
-from .streaming import AnthropicStreamTap, text_from_non_streaming
+from .protocol import openai as oa
+from .streaming import (
+    AnthropicStreamTap,
+    OpenAIStreamTap,
+    text_from_non_streaming,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,23 +73,59 @@ async def flush_pending_writes(timeout: float = 10.0) -> int:
     return len(done)
 
 
+class ProtocolSpec:
+    """What differs between the two wire formats."""
+
+    def __init__(self, name: str, module, path: str, tap_factory: Callable,
+                 non_streaming_text: Callable, auth_header: str):
+        self.name = name
+        self.module = module
+        self.path = path
+        self.tap_factory = tap_factory
+        self.non_streaming_text = non_streaming_text
+        self.auth_header = auth_header
+
+
+ANTHROPIC = ProtocolSpec(
+    name="anthropic",
+    module=ap,
+    path="/v1/messages",
+    tap_factory=AnthropicStreamTap,
+    non_streaming_text=text_from_non_streaming,
+    auth_header="x-api-key",
+)
+
+OPENAI = ProtocolSpec(
+    name="openai",
+    module=oa,
+    path="/v1/chat/completions",
+    tap_factory=OpenAIStreamTap,
+    non_streaming_text=oa.text_from_non_streaming,
+    auth_header="authorization",
+)
+
+
 def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
                   bridge_url: Optional[str] = None,
                   timeout: float = 600.0,
-                  injection_cache: Optional[InjectionCache] = None) -> APIRouter:
+                  injection_cache: Optional[InjectionCache] = None,
+                  protocol: ProtocolSpec = ANTHROPIC) -> APIRouter:
     """
     Args:
         get_service: returns the MemoryService. A callable rather than the
             object itself because the service is built during startup, after
             routes are registered.
-        upstream_url: real Anthropic base, e.g. https://api.anthropic.com
+        upstream_url: real provider base, e.g. https://api.anthropic.com
         upstream_key: API key to use upstream; when None the client's own
             key is passed through, which is what a local setup wants
         bridge_url: base URL for block fetches, advertised to the model
         injection_cache: pins the rendered memory block per session so the
             upstream prompt prefix stays byte-identical and stays cacheable
+        protocol: ANTHROPIC or OPENAI
     """
     service_cache = injection_cache or InjectionCache()
+    proto = protocol
+    fmt = protocol.module
     router = APIRouter()
 
     async def _recall(query: str, session_id: str) -> Optional[Dict[str, Any]]:
@@ -95,6 +142,18 @@ def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
             logger.error(f"recall failed, continuing without memory: {e}",
                          exc_info=True)
             return None
+
+    async def _ingest(handle: Optional[str], query: str, reply: str,
+                      session_id: str) -> None:
+        if not reply:
+            return
+        try:
+            service = get_service()
+            ctx = service.contexts.take(handle) if handle else None
+            await service.client.ingest(query, reply, ctx=ctx,
+                                        session_id=session_id)
+        except Exception as e:
+            logger.error(f"ingest failed: {e}", exc_info=True)
 
     async def _memory_for_turn(query: str, session_id: str
                                ) -> Tuple[str, Optional[str]]:
@@ -120,30 +179,17 @@ def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
         service_cache.put(session_id, block)
         if block:
             logger.info(
-                f"[{session_id}] built memory block ({len(block)} chars), "
-                f"pinned for this session"
+                f"[{proto.name}][{session_id}] built memory block "
+                f"({len(block)} chars), pinned for this session"
             )
         return block, handle
 
-    async def _ingest(handle: Optional[str], query: str, reply: str,
-                      session_id: str) -> None:
-        if not reply:
-            return
-        try:
-            service = get_service()
-            ctx = service.contexts.take(handle) if handle else None
-            await service.client.ingest(query, reply, ctx=ctx,
-                                        session_id=session_id)
-        except Exception as e:
-            logger.error(f"ingest failed: {e}", exc_info=True)
-
-    @router.post("/v1/messages")
-    async def messages(request: Request):
+    @router.post(proto.path)
+    async def completions(request: Request):
         raw = await request.body()
         headers = dict(request.headers)
 
         try:
-            import json
             body = json.loads(raw)
         except Exception:
             # Not our shape to interpret; hand it upstream untouched.
@@ -154,24 +200,28 @@ def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
             if k.lower() not in SKIP_REQUEST_HEADERS
         }
         if upstream_key:
-            fwd_headers["x-api-key"] = upstream_key
-            fwd_headers.pop("authorization", None)
+            if proto.auth_header == "authorization":
+                fwd_headers["authorization"] = f"Bearer {upstream_key}"
+                fwd_headers.pop("x-api-key", None)
+            else:
+                fwd_headers["x-api-key"] = upstream_key
+                fwd_headers.pop("authorization", None)
 
         session_id = "default_session"
         query = ""
         handle = None
 
         if isinstance(body, dict):
-            session_id = ap.session_hint(body, headers)
-            query = ap.last_user_text(body)
+            session_id = fmt.session_hint(body, headers)
+            query = fmt.last_user_text(body)
 
             block, handle = await _memory_for_turn(query, session_id)
             if block:
-                body = ap.append_to_system(body, block)
+                body = fmt.append_to_system(body, block)
             raw = json.dumps(body).encode("utf-8")
 
-        streaming = isinstance(body, dict) and ap.is_streaming(body)
-        url = f"{upstream_url.rstrip('/')}/v1/messages"
+        streaming = isinstance(body, dict) and fmt.is_streaming(body)
+        url = f"{upstream_url.rstrip('/')}{proto.path}"
 
         if not streaming:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -179,7 +229,7 @@ def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
 
             if upstream.status_code == 200 and query:
                 try:
-                    reply = text_from_non_streaming(upstream.json())
+                    reply = proto.non_streaming_text(upstream.json())
                     _spawn(_ingest(handle, query, reply, session_id))
                 except Exception as e:
                     logger.error(f"Could not read non-streaming reply: {e}")
@@ -192,7 +242,7 @@ def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
             )
 
         async def relay():
-            tap = AnthropicStreamTap()
+            tap = proto.tap_factory()
             client = httpx.AsyncClient(timeout=timeout)
             try:
                 async with client.stream("POST", url, content=raw,

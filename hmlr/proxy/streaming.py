@@ -134,3 +134,97 @@ def text_from_non_streaming(body: Dict[str, Any]) -> str:
         for b in content
         if isinstance(b, dict) and b.get("type") == "text"
     ).strip()
+
+
+class OpenAIStreamTap:
+    """
+    Same idea as AnthropicStreamTap, for Chat Completions.
+
+    Differences that matter:
+      - text arrives as choices[0].delta.content, not a typed delta
+      - the stream ends with a literal `data: [DONE]` sentinel
+      - usage is only present when the caller set stream_options.include_usage
+    """
+
+    def __init__(self) -> None:
+        self._buffer = b""
+        self._text_parts: List[str] = []
+        self._tool_call_ids: set = set()
+        self.usage: Dict[str, int] = {}
+        self.finish_reason: Optional[str] = None
+        self.model: Optional[str] = None
+        self.parse_errors = 0
+        self.saw_done = False
+
+    @property
+    def assistant_text(self) -> str:
+        return "".join(self._text_parts).strip()
+
+    @property
+    def tool_use_count(self) -> int:
+        return len(self._tool_call_ids)
+
+    def feed(self, chunk: bytes) -> None:
+        try:
+            self._buffer += chunk
+            while b"\n\n" in self._buffer:
+                raw_event, self._buffer = self._buffer.split(b"\n\n", 1)
+                self._handle_event(raw_event)
+        except Exception as e:
+            self.parse_errors += 1
+            logger.debug(f"Stream tap error (ignored): {e}")
+
+    def finish(self) -> None:
+        if self._buffer.strip():
+            try:
+                self._handle_event(self._buffer)
+            except Exception as e:
+                logger.debug(f"Stream tap flush error (ignored): {e}")
+            self._buffer = b""
+
+    def _handle_event(self, raw_event: bytes) -> None:
+        payload = None
+        for line in raw_event.split(b"\n"):
+            if line.startswith(b"data:"):
+                payload = line[5:].strip()
+                break
+        if not payload:
+            return
+        if payload == b"[DONE]":
+            self.saw_done = True
+            return
+
+        try:
+            data = json.loads(payload.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            self.parse_errors += 1
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        if data.get("model"):
+            self.model = data["model"]
+        if data.get("usage"):
+            self.usage.update(data["usage"])
+
+        for choice in data.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                self.finish_reason = choice["finish_reason"]
+
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str):
+                self._text_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        self._text_parts.append(part.get("text", ""))
+
+            for call in delta.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    # Index, not id: ids arrive only on the first fragment of
+                    # each call, while index is present throughout.
+                    self._tool_call_ids.add(call.get("index", call.get("id")))
