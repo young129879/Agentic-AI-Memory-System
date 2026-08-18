@@ -3,14 +3,53 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SESSION_ID = "default_session"
+
+# Tables scoped to a single conversation session.
+#
+# Session-scoped data is per-window: two Claude Code windows discussing
+# unrelated topics must not see each other's bridge blocks or vectors.
+#
+# Deliberately NOT listed here: dossiers / dossier_facts / dossier_provenance.
+# Dossiers aggregate facts *across* sessions and topics — scoping them by
+# session would destroy their entire purpose.
+SESSION_SCOPED_TABLES = (
+    "daily_ledger",
+    "ledger_turns",
+    "fact_store",
+    "embeddings",
+    "gardened_memory",
+    "block_metadata",
+    "spans",
+)
+
 
 def initialize_database(conn: sqlite3.Connection):
     """
     Apply DDL and migrations to the provided SQLite connection.
     Delegates to specialized functions for DDL and migrations.
     """
+    _apply_pragmas(conn)
     _create_tables(conn)
     _run_migrations(conn)
+
+
+def _apply_pragmas(conn: sqlite3.Connection):
+    """
+    Enable concurrent-friendly settings.
+
+    WAL lets readers proceed while a writer holds the write lock, which is
+    required once multiple agent sessions hit the same database at once.
+    busy_timeout makes contending writers wait instead of raising
+    'database is locked' immediately.
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error as e:
+        logger.warning(f"Could not apply concurrency pragmas: {e}")
 
 def _create_tables(conn: sqlite3.Connection):
     """
@@ -136,6 +175,7 @@ def _create_tables(conn: sqlite3.Connection):
         CREATE TABLE IF NOT EXISTS spans (
             span_id TEXT PRIMARY KEY,
             day_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT 'default_session',
             created_at TIMESTAMP NOT NULL,
             last_active_at TIMESTAMP NOT NULL,
             topic_label TEXT,
@@ -154,6 +194,7 @@ def _create_tables(conn: sqlite3.Connection):
             block_id TEXT PRIMARY KEY,
             prev_block_id TEXT,
             span_id TEXT,
+            session_id TEXT NOT NULL DEFAULT 'default_session',
             content_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT,
@@ -172,6 +213,7 @@ def _create_tables(conn: sqlite3.Connection):
         CREATE TABLE IF NOT EXISTS ledger_turns (
             turn_id TEXT PRIMARY KEY,
             block_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT 'default_session',
             timestamp TEXT NOT NULL,
             user_message TEXT NOT NULL,
             assistant_response TEXT NOT NULL,
@@ -189,6 +231,7 @@ def _create_tables(conn: sqlite3.Connection):
             key TEXT NOT NULL,
             value TEXT NOT NULL,
             category TEXT,
+            session_id TEXT NOT NULL DEFAULT 'default_session',
             source_span_id TEXT,
             source_chunk_id TEXT,
             source_paragraph_id TEXT,
@@ -224,6 +267,7 @@ def _create_tables(conn: sqlite3.Connection):
         CREATE TABLE IF NOT EXISTS embeddings (
             embedding_id TEXT PRIMARY KEY,
             turn_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT 'default_session',
             chunk_index INTEGER NOT NULL,
             embedding BLOB NOT NULL,
             text_content TEXT NOT NULL,
@@ -237,6 +281,12 @@ def _create_tables(conn: sqlite3.Connection):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_embedding_chunk ON embeddings(turn_id, chunk_index)")
     
     # === DOSSIER SYSTEM TABLES ===
+    #
+    # NOTE: dossier tables are intentionally NOT session-scoped.
+    # A dossier's value comes from aggregating facts across sessions and
+    # across time (e.g. a policy renamed over months of conversations).
+    # Adding session_id here would fragment every dossier per window and
+    # break cross-topic reasoning.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS dossiers (
             dossier_id TEXT PRIMARY KEY,
@@ -288,6 +338,7 @@ def _create_tables(conn: sqlite3.Connection):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS block_metadata (
             block_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL DEFAULT 'default_session',
             global_tags TEXT,
             section_rules TEXT,
             created_at TEXT NOT NULL,
@@ -302,6 +353,7 @@ def _create_tables(conn: sqlite3.Connection):
             chunk_id TEXT PRIMARY KEY,
             block_id TEXT NOT NULL,
             turn_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT 'default_session',
             chunk_type TEXT NOT NULL,
             text_content TEXT NOT NULL,
             parent_id TEXT,
@@ -363,5 +415,44 @@ def _run_migrations(conn: sqlite3.Connection):
         logger.info("Migrating gardened_memory: Adding turn_id column")
         cursor.execute("ALTER TABLE gardened_memory ADD COLUMN turn_id TEXT")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_gardened_turn ON gardened_memory(turn_id)")
-    
+
+    # Migration: session scoping.
+    #
+    # Existing rows predate multi-session support and all belong to one
+    # implicit timeline, so they are backfilled with DEFAULT_SESSION_ID
+    # rather than dropped.
+    #
+    # Indexes are created here rather than in _create_tables() because on a
+    # pre-existing database the table is left untouched by CREATE TABLE IF
+    # NOT EXISTS, so the column only appears after the ALTER below.
+    for table in SESSION_SCOPED_TABLES:
+        try:
+            cursor.execute(f"SELECT session_id FROM {table} LIMIT 1")
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e).lower():
+                continue
+            logger.info(f"Migrating {table}: Adding session_id column")
+            cursor.execute(
+                f"ALTER TABLE {table} ADD COLUMN session_id TEXT "
+                f"NOT NULL DEFAULT '{DEFAULT_SESSION_ID}'"
+            )
+
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_session "
+            f"ON {table}(session_id)"
+        )
+
+    # Hot path: "active blocks for this session" is the most frequent lookup.
+    try:
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_session_status "
+            "ON daily_ledger(session_id, status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fact_session_key "
+            "ON fact_store(session_id, key)"
+        )
+    except sqlite3.OperationalError as e:
+        logger.warning(f"Could not create composite session indexes: {e}")
+
     conn.commit()
