@@ -80,3 +80,9 @@ class HealthResponse(BaseModel):
     version: str
     db_path: Optional[str] = None
     sessions_cached: int = 0
+    injection_cache: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Hit rate for the per-session injected memory block. "
+                    "A low rate means the upstream prompt prefix is changing "
+                    "between turns and prompt caching is being defeated.",
+    )

@@ -18,13 +18,14 @@ after the response is fully delivered, off the request path.
 
 import asyncio
 import logging
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .injection import build_memory_block
+from .injection_cache import InjectionCache
 from .protocol import anthropic as ap
 from .streaming import AnthropicStreamTap, text_from_non_streaming
 
@@ -63,7 +64,8 @@ async def flush_pending_writes(timeout: float = 10.0) -> int:
 
 def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
                   bridge_url: Optional[str] = None,
-                  timeout: float = 600.0) -> APIRouter:
+                  timeout: float = 600.0,
+                  injection_cache: Optional[InjectionCache] = None) -> APIRouter:
     """
     Args:
         get_service: returns the MemoryService. A callable rather than the
@@ -73,7 +75,10 @@ def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
         upstream_key: API key to use upstream; when None the client's own
             key is passed through, which is what a local setup wants
         bridge_url: base URL for block fetches, advertised to the model
+        injection_cache: pins the rendered memory block per session so the
+            upstream prompt prefix stays byte-identical and stays cacheable
     """
+    service_cache = injection_cache or InjectionCache()
     router = APIRouter()
 
     async def _recall(query: str, session_id: str) -> Optional[Dict[str, Any]]:
@@ -90,6 +95,35 @@ def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
             logger.error(f"recall failed, continuing without memory: {e}",
                          exc_info=True)
             return None
+
+    async def _memory_for_turn(query: str, session_id: str
+                               ) -> Tuple[str, Optional[str]]:
+        """
+        Return (block_to_inject, ingest_handle) for this turn.
+
+        recall() always runs: routing decides which bridge block the turn
+        belongs to, and it is a write. Only the rendered text is cached,
+        because that text is the cached prefix of the upstream prompt and
+        must be byte-identical across the session.
+        """
+        recall = await _recall(query, session_id)
+        handle = recall.get("context") if recall else None
+
+        cached = service_cache.get(session_id)
+        if cached is not None:
+            return cached, handle
+
+        block = build_memory_block(recall, bridge_url=bridge_url) if recall else ""
+        # Cached even when empty: an early turn with no memory yet would
+        # otherwise retry rendering on every subsequent turn, and injecting
+        # memory partway through would invalidate the prefix anyway.
+        service_cache.put(session_id, block)
+        if block:
+            logger.info(
+                f"[{session_id}] built memory block ({len(block)} chars), "
+                f"pinned for this session"
+            )
+        return block, handle
 
     async def _ingest(handle: Optional[str], query: str, reply: str,
                       session_id: str) -> None:
@@ -131,16 +165,9 @@ def create_router(get_service, upstream_url: str, upstream_key: Optional[str],
             session_id = ap.session_hint(body, headers)
             query = ap.last_user_text(body)
 
-            recall = await _recall(query, session_id)
-            if recall:
-                handle = recall.get("context")
-                block = build_memory_block(recall, bridge_url=bridge_url)
-                if block:
-                    body = ap.append_to_system(body, block)
-                    logger.info(
-                        f"[{session_id}] injected {len(block)} chars "
-                        f"(block={recall.get('block_id')})"
-                    )
+            block, handle = await _memory_for_turn(query, session_id)
+            if block:
+                body = ap.append_to_system(body, block)
             raw = json.dumps(body).encode("utf-8")
 
         streaming = isinstance(body, dict) and ap.is_streaming(body)

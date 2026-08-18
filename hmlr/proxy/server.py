@@ -40,9 +40,11 @@ class MemoryService:
 
     def __init__(self, db_path: Optional[str] = None,
                  api_key: Optional[str] = None,
-                 context_ttl: int = 3600):
+                 context_ttl: int = 3600,
+                 injection_cache=None):
         self.client = HMLRClient(api_key=api_key, db_path=db_path)
         self.contexts = ContextStore(ttl_seconds=context_ttl)
+        self.injection = injection_cache
         logger.info(f"Memory service ready (db={self.client.db_path})")
 
 
@@ -51,9 +53,15 @@ def create_app(db_path: Optional[str] = None,
                context_ttl: int = 3600,
                upstream_url: Optional[str] = None,
                upstream_key: Optional[str] = None,
-               bridge_url: Optional[str] = None) -> FastAPI:
+               bridge_url: Optional[str] = None,
+               injection_ttl: int = 7200) -> FastAPI:
 
     service: dict = {}
+
+    # Owned here rather than by MemoryService because the proxy router is
+    # built before startup and needs the same instance.
+    from .injection_cache import InjectionCache
+    injection_cache = InjectionCache(ttl_seconds=injection_ttl)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -63,6 +71,7 @@ def create_app(db_path: Optional[str] = None,
             db_path=db_path or os.getenv("HMLR_DB_PATH"),
             api_key=api_key,
             context_ttl=context_ttl,
+            injection_cache=injection_cache,
         )
         yield
         # Streamed turns are persisted after the response is delivered, so a
@@ -96,6 +105,7 @@ def create_app(db_path: Optional[str] = None,
             version=VERSION,
             db_path=str(instance.client.db_path),
             sessions_cached=len(instance.contexts),
+            injection_cache=injection_cache.stats(),
         )
 
     @app.post("/memory/recall", response_model=RecallResponse)
@@ -181,6 +191,7 @@ def create_app(db_path: Optional[str] = None,
             upstream_url=resolved_upstream,
             upstream_key=upstream_key or os.getenv("ANTHROPIC_API_KEY"),
             bridge_url=bridge_url,
+            injection_cache=injection_cache,
         ))
         logger.info(f"Anthropic proxy enabled -> {resolved_upstream}")
 
