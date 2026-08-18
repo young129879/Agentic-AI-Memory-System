@@ -487,9 +487,9 @@ If no facts found, return: {{"facts": []}}
             INSERT INTO fact_store (
                 key, value, category, evidence_snippet,
                 source_chunk_id, source_paragraph_id, source_block_id, 
-                source_turn_id, source_span_id, created_at
+                source_turn_id, source_span_id, session_id, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             fact.key,
             fact.value,
@@ -500,6 +500,7 @@ If no facts found, return: {{"facts": []}}
             fact.source_block_id,
             fact.source_turn_id,
             fact.source_span_id,
+            self.storage.session_for_turn(fact.source_turn_id),
             fact.created_at
         ))
         self.storage.conn.commit()

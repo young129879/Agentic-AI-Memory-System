@@ -196,6 +196,7 @@ class EmbeddingStorage:
             Number of embeddings saved
         """
         cursor = self.storage.conn.cursor()
+        session_id = self.storage.session_for_turn(turn_id)
         
         for idx, chunk_text in enumerate(chunks):
             # Generate embedding
@@ -210,11 +211,12 @@ class EmbeddingStorage:
             # Store in database
             cursor.execute("""
                 INSERT OR REPLACE INTO embeddings 
-                (embedding_id, turn_id, chunk_index, embedding, text_content, dimension, model_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (embedding_id, turn_id, session_id, chunk_index, embedding, text_content, dimension, model_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 embedding_id,
                 turn_id,
+                session_id,
                 idx,
                 embedding_bytes,
                 chunk_text,

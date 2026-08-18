@@ -466,6 +466,35 @@ class Storage:
     # VECTOR EMBEDDINGS METHODS
     # ============================================================================
     
+    def session_for_turn(self, turn_id: str) -> str:
+        """
+        Resolve which session a turn belongs to.
+
+        Rows keyed by turn_id (embeddings, facts) inherit their session from
+        the turn rather than accepting it as an argument, so callers deep in
+        the pipeline cannot file them under the wrong session.
+
+        metadata_staging is checked first because every turn is logged there
+        before any downstream processing; ledger_turns is the fallback for
+        turns that were promoted into a bridge block.
+        """
+        from .persistence.schema import DEFAULT_SESSION_ID
+
+        if not turn_id:
+            return DEFAULT_SESSION_ID
+        try:
+            cursor = self.conn.cursor()
+            for table in ("metadata_staging", "ledger_turns"):
+                row = cursor.execute(
+                    f"SELECT session_id FROM {table} WHERE turn_id = ? LIMIT 1",
+                    (turn_id,)
+                ).fetchone()
+                if row and row[0]:
+                    return row[0]
+        except sqlite3.Error as e:
+            logger.debug(f"Could not resolve session for turn {turn_id}: {e}")
+        return DEFAULT_SESSION_ID
+
     def save_embedding(self, embedding_id: str, turn_id: str, chunk_index: int,
                       embedding_bytes: bytes, text_content: str,
                       dimension: int = None, model_name: str = None):
@@ -488,9 +517,10 @@ class Storage:
         
         cursor.execute("""
             INSERT OR REPLACE INTO embeddings
-            (embedding_id, turn_id, chunk_index, embedding, text_content, dimension, model_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (embedding_id, turn_id, chunk_index, embedding_bytes, text_content, dimension, model_name))
+            (embedding_id, turn_id, session_id, chunk_index, embedding, text_content, dimension, model_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (embedding_id, turn_id, self.session_for_turn(turn_id), chunk_index,
+              embedding_bytes, text_content, dimension, model_name))
         
         self.conn.commit()
     
