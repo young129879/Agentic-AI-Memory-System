@@ -48,7 +48,10 @@ class MemoryService:
 
 def create_app(db_path: Optional[str] = None,
                api_key: Optional[str] = None,
-               context_ttl: int = 3600) -> FastAPI:
+               context_ttl: int = 3600,
+               upstream_url: Optional[str] = None,
+               upstream_key: Optional[str] = None,
+               bridge_url: Optional[str] = None) -> FastAPI:
 
     service: dict = {}
 
@@ -62,6 +65,12 @@ def create_app(db_path: Optional[str] = None,
             context_ttl=context_ttl,
         )
         yield
+        # Streamed turns are persisted after the response is delivered, so a
+        # write can still be in flight when shutdown begins.
+        from .anthropic_handler import flush_pending_writes
+        flushed = await flush_pending_writes(timeout=10.0)
+        if flushed:
+            logger.info(f"Flushed {flushed} pending memory writes")
         service.clear()
 
     app = FastAPI(
@@ -155,6 +164,20 @@ def create_app(db_path: Optional[str] = None,
             content={"detail": "Internal memory service error", "error": str(exc)},
         )
 
+    # Anthropic-compatible proxy. Mounted only when an upstream is configured,
+    # so the service can also run as memory-only with no LLM credentials.
+    resolved_upstream = upstream_url or os.getenv("HMLR_UPSTREAM_URL")
+    if resolved_upstream:
+        from .anthropic_handler import create_router
+
+        app.include_router(create_router(
+            get_service=get_service,
+            upstream_url=resolved_upstream,
+            upstream_key=upstream_key or os.getenv("ANTHROPIC_API_KEY"),
+            bridge_url=bridge_url,
+        ))
+        logger.info(f"Anthropic proxy enabled -> {resolved_upstream}")
+
     return app
 
 
@@ -171,6 +194,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--db", default=os.getenv("HMLR_DB_PATH"),
                         help="SQLite path (default: HMLR's own default)")
+    parser.add_argument("--upstream",
+                        default=os.getenv("HMLR_UPSTREAM_URL"),
+                        help="Anthropic base URL; enables the proxy endpoint. "
+                             "e.g. https://api.anthropic.com")
+    parser.add_argument("--upstream-key", default=os.getenv("ANTHROPIC_API_KEY"),
+                        help="Key sent upstream. Omit to pass the client's own through.")
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
 
@@ -179,8 +208,13 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    bridge = f"http://{args.host}:{args.port}/memory"
+
     uvicorn.run(
-        create_app(db_path=args.db),
+        create_app(db_path=args.db,
+                   upstream_url=args.upstream,
+                   upstream_key=args.upstream_key,
+                   bridge_url=bridge),
         host=args.host,
         port=args.port,
         log_level=args.log_level,
