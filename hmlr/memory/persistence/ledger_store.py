@@ -4,12 +4,32 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
 
+from .schema import DEFAULT_SESSION_ID
+
 logger = logging.getLogger(__name__)
 
 class LedgerStore:
     """
     Handles Bridge Block and Daily Ledger persistence operations.
     """
+
+    @staticmethod
+    def _session_for_block(conn: sqlite3.Connection, block_id: str) -> str:
+        """
+        Resolve which session a block belongs to.
+
+        Child rows (turns, metadata, gardened chunks) derive their session from
+        the owning block instead of accepting it as an argument, so a caller
+        cannot accidentally file them under the wrong session.
+        """
+        try:
+            row = conn.cursor().execute(
+                "SELECT session_id FROM daily_ledger WHERE block_id = ?",
+                (block_id,)
+            ).fetchone()
+            return row[0] if row and row[0] else DEFAULT_SESSION_ID
+        except sqlite3.Error:
+            return DEFAULT_SESSION_ID
 
     @staticmethod
     def get_active_bridge_blocks(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -142,12 +162,16 @@ class LedgerStore:
         topic_label: str,
         keywords: List[str],
         span_id: Optional[str] = None,
+        session_id: str = DEFAULT_SESSION_ID,
         **kwargs
     ) -> Optional[str]:
         """
         Create a new Bridge Block.
         Turns are stored in a separate table, so turns[] is removed from content_json.
         Any additional kwargs are merged into the content JSON for extensibility.
+
+        session_id scopes the block to one conversation session so that
+        concurrent agent windows do not retrieve each other's topics.
         """
         from uuid import uuid4
         block_id = f"bb_{day_id.replace('-', '')}_{uuid4().hex[:8]}"
@@ -180,15 +204,15 @@ class LedgerStore:
             date_str = timestamp[:10]  # timestamp is "YYYY-MM-DD HH:MM:SS"
             cursor.execute("""
                 INSERT INTO daily_ledger (
-                    block_id, prev_block_id, span_id, content_json,
+                    block_id, prev_block_id, span_id, session_id, content_json,
                     created_at, updated_at, status, exit_reason, embedding_status, date
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                block_id, None, span_id, json.dumps(content),
+                block_id, None, span_id, session_id, json.dumps(content),
                 timestamp, timestamp, 'ACTIVE', None, 'PENDING', date_str
             ))
             conn.commit()
-            logger.info(f"Created new bridge block: {block_id} (topic: {topic_label}, date: {date_str})")
+            logger.info(f"Created new bridge block: {block_id} (topic: {topic_label}, session: {session_id}, date: {date_str})")
             return block_id
         except Exception as e:
             logger.error(f"Failed to create bridge block: {e}", exc_info=True)
@@ -200,6 +224,10 @@ class LedgerStore:
         """
         Append a new conversation turn to Bridge Block via the ledger_turns table.
         This provides O(1) appends and prevents race conditions on large JSON blobs.
+
+        The turn inherits session_id from its parent block rather than taking it
+        as an argument: a turn cannot belong to a different session than the
+        block that owns it, so deriving it removes a whole class of caller bugs.
         """
         cursor = conn.cursor()
         
@@ -215,15 +243,18 @@ class LedgerStore:
             if kwargs:
                 metadata.update(kwargs)
 
+            session_id = LedgerStore._session_for_block(conn, block_id)
+
             # 1. Insert into normalized ledger_turns table
             cursor.execute("""
                 INSERT INTO ledger_turns (
-                    turn_id, block_id, timestamp, user_message, 
+                    turn_id, block_id, session_id, timestamp, user_message, 
                     assistant_response, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 turn.get('turn_id'),
                 block_id,
+                session_id,
                 turn.get('timestamp', datetime.now().isoformat()),
                 turn.get('user_message', ''),
                 turn.get('ai_response') or turn.get('assistant_response', ''),
@@ -388,9 +419,15 @@ class LedgerStore:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO block_metadata 
-            (block_id, global_tags, section_rules, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (block_id, json.dumps(global_tags), json.dumps(section_rules), datetime.now().isoformat()))
+            (block_id, session_id, global_tags, section_rules, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            block_id,
+            LedgerStore._session_for_block(conn, block_id),
+            json.dumps(global_tags),
+            json.dumps(section_rules),
+            datetime.now().isoformat(),
+        ))
         conn.commit()
 
     @staticmethod
@@ -412,15 +449,18 @@ class LedgerStore:
     def link_facts_to_block(conn: sqlite3.Connection, turn_id: str, block_id: str) -> int:
         """
         Update facts to link them to the correct Bridge Block.
+
+        Facts are extracted before their owning block is known, so they land
+        with the default session. Backfill it here alongside the block link.
         """
         cursor = conn.cursor()
         timestamp = turn_id.replace("turn_", "")
         cursor.execute("""
             UPDATE fact_store
-            SET source_block_id = ?
+            SET source_block_id = ?, session_id = ?
             WHERE source_chunk_id LIKE ?
               AND (source_block_id IS NULL OR source_block_id = '')
-        """, (block_id, f"%{timestamp}%"))
+        """, (block_id, LedgerStore._session_for_block(conn, block_id), f"%{timestamp}%"))
         count = cursor.rowcount
         conn.commit()
         return count
@@ -432,17 +472,19 @@ class LedgerStore:
         """
         cursor = conn.cursor()
         saved_count = 0
+        session_id = LedgerStore._session_for_block(conn, block_id)
         try:
             for chunk in chunks:
                 cursor.execute("""
                     INSERT OR REPLACE INTO gardened_memory (
-                        chunk_id, block_id, turn_id, chunk_type,
+                        chunk_id, block_id, turn_id, session_id, chunk_type,
                         text_content, parent_id, global_tags, token_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     chunk.get('chunk_id'),
                     block_id,
                     chunk.get('turn_id', ''),
+                    session_id,
                     chunk.get('chunk_type', 'turn'),
                     chunk.get('text_verbatim', chunk.get('text_content', '')),
                     chunk.get('parent_chunk_id'),
