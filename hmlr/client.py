@@ -90,10 +90,45 @@ class HMLRClient:
         )
         
         return {
-            "content": response.content,
+            "content": response.response_text,
             "status": response.status.value,
-            "metadata": response.metadata if hasattr(response, 'metadata') else {}
+            "intent": response.detected_intent,
+            "contexts_retrieved": response.contexts_retrieved,
+            "error": response.error_message,
         }
+
+    async def recall(self, query: str, session_id: str = "default_session"):
+        """
+        Retrieve memory for a query without generating a reply.
+
+        For callers that supply their own model -- a proxy in front of Claude
+        Code, say -- and only need the memory half of the pipeline.
+
+        The returned RecallResult carries both the injectable memory and the
+        state ingest() needs; hand it back unchanged.
+
+        Example:
+            ctx = await client.recall("how do I deploy?", session_id="s1")
+            reply = await my_own_llm(build_prompt(ctx))
+            await client.ingest("how do I deploy?", reply, ctx, session_id="s1")
+        """
+        return await self.engine.recall(query, session_id=session_id)
+
+    async def ingest(self, user_message: str, assistant_reply: str,
+                     ctx=None, session_id: str = "default_session") -> bool:
+        """
+        Persist a turn generated outside HMLR.
+
+        Args:
+            ctx: RecallResult from the matching recall() call. Omitting it
+                logs the turn but cannot attach it to a bridge block.
+
+        Returns:
+            True if the turn was attached to its block.
+        """
+        return await self.engine.ingest(
+            user_message, assistant_reply, ctx=ctx, session_id=session_id
+        )
     
     def get_memory_stats(self) -> Dict[str, Any]:
         """

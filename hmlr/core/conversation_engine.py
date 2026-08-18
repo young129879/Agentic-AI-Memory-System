@@ -13,6 +13,7 @@ from typing import Tuple, Optional, List, Dict, Any
 from datetime import datetime
 
 from hmlr.core.models import ConversationResponse, ResponseStatus
+from hmlr.core.models.recall_result import RecallResult
 from .exceptions import ApiConnectionError, ConfigurationError, RetrievalError, StorageWriteError
 from .config import config
 from .model_config import model_config
@@ -502,6 +503,218 @@ class ConversationEngine:
                 error_message=str(e),
                 error_traceback=error_trace
             )
+
+    # =====================================================================
+    # Split-phase API (recall / ingest)
+    #
+    # Same pipeline as _handle_chat, minus the generation step, so a proxy
+    # can put its own model in the middle. _handle_chat is left untouched
+    # so the CLI path cannot regress.
+    # =====================================================================
+
+    async def recall(self, user_query: str,
+                     session_id: str = "default_session") -> RecallResult:
+        """
+        Retrieve memory for a turn without generating a reply.
+
+        Mirrors the first half of _handle_chat: chunk, extract facts, run the
+        governor, execute the routing decision, then load the block's facts.
+
+        Routing is a write: it pauses and creates blocks. That is intentional
+        and must happen exactly once per turn, which is why the resulting
+        block_id is returned for ingest() to reuse rather than recomputed.
+        """
+        result = RecallResult(session_id=session_id)
+
+        if not self.governor:
+            result.degraded = True
+            result.error = "governor unavailable"
+            return result
+
+        try:
+            day_id = self.conversation_mgr.current_day
+            turn_id = f"turn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            result.day_id = day_id
+            result.turn_id = turn_id
+
+            chunks = []
+            if self.chunk_engine:
+                chunks = self.chunk_engine.chunk_turn(
+                    text=user_query, turn_id=turn_id, span_id=None
+                )
+            result.chunks = chunks
+
+            fact_task = None
+            if self.fact_scrubber and chunks:
+                fact_task = asyncio.create_task(
+                    self.fact_scrubber.extract_and_save(
+                        turn_id=turn_id, message_text=user_query,
+                        chunks=chunks, span_id=None, block_id=None
+                    )
+                )
+
+            try:
+                routing, memories, facts, dossiers = await self.governor.govern(
+                    user_query, day_id, session_id=session_id
+                )
+            except RetrievalError as e:
+                logger.error(f"recall: retrieval failed ({e}); continuing without memory")
+                routing = {'matched_block_id': None, 'is_new_topic': True,
+                           'suggested_label': 'General Discussion'}
+                memories, facts, dossiers = [], [], []
+                result.degraded = True
+                result.error = str(e)
+
+            result.routing_decision = routing
+            result.memories = memories
+            result.facts = facts
+            result.dossiers = dossiers
+
+            block_id, is_new_topic = self._execute_routing(
+                routing, day_id, session_id
+            )
+            result.block_id = block_id
+            result.is_new_topic = is_new_topic
+
+            if fact_task:
+                extracted = await fact_task
+                if extracted and block_id:
+                    self.storage.update_facts_block_id(turn_id, block_id)
+
+            if block_id:
+                result.block_facts = self.storage.get_facts_for_block(block_id)
+
+            result.block_index = self._build_block_index(session_id)
+            result.open_loops = self._collect_open_loops(session_id)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"recall failed: {e}", exc_info=True)
+            result.degraded = True
+            result.error = str(e)
+            return result
+
+    async def ingest(self, user_query: str, assistant_reply: str,
+                     ctx: Optional[RecallResult] = None,
+                     session_id: str = "default_session") -> bool:
+        """
+        Persist a completed turn.
+
+        ctx is the RecallResult from the matching recall() call. Without it the
+        turn cannot be attached to the block it was routed into, so it is
+        logged to the session only -- accepted rather than dropped, because
+        losing the raw turn is worse than losing its block association.
+        """
+        try:
+            if ctx is None or not ctx.block_id:
+                logger.warning("ingest without recall context: logging turn only")
+                self.log_conversation_turn(user_query, assistant_reply,
+                                           session_id=session_id)
+                return False
+
+            turn_data = {
+                "turn_id": ctx.turn_id,
+                "timestamp": datetime.now().isoformat(),
+                "user_message": user_query,
+                "ai_response": assistant_reply,
+                "chunks": [{
+                    "chunk_id": c.chunk_id,
+                    "chunk_type": c.chunk_type,
+                    "text_verbatim": c.text_verbatim,
+                    "parent_chunk_id": c.parent_chunk_id,
+                    "token_count": c.token_count,
+                } for c in ctx.chunks] if ctx.chunks else []
+            }
+
+            ok = self.storage.append_turn_to_block(ctx.block_id, turn_data)
+            if not ok:
+                logger.error(f"ingest: failed to append turn {ctx.turn_id} "
+                             f"to block {ctx.block_id}")
+
+            self.log_conversation_turn(user_query, assistant_reply,
+                                       session_id=ctx.session_id or session_id)
+            return ok
+
+        except Exception as e:
+            logger.error(f"ingest failed: {e}", exc_info=True)
+            return False
+
+    def _execute_routing(self, routing_decision: Dict[str, Any], day_id: str,
+                         session_id: str) -> Tuple[Optional[str], bool]:
+        """
+        Apply a routing decision: continue, resume, or open a topic.
+
+        Extracted from _handle_chat so recall() runs the identical four
+        scenarios instead of a second, drifting copy.
+        """
+        matched_block_id = routing_decision.get('matched_block_id')
+        is_new = routing_decision.get('is_new_topic', False)
+        suggested_label = routing_decision.get('suggested_label', 'General Discussion')
+        keywords = (getattr(self, '_current_metadata', {}) or {}).get('keywords', []) or []
+
+        active_blocks = self.storage.get_active_bridge_blocks(session_id)
+        last_active = next(
+            (b for b in active_blocks if b.get('status') == 'ACTIVE'), None
+        )
+
+        def _pause(block_id: str) -> None:
+            self.storage.update_bridge_block_status(block_id, 'PAUSED',
+                                                    session_id=session_id)
+            self.storage.generate_block_summary(block_id)
+
+        if matched_block_id and last_active and matched_block_id == last_active['block_id']:
+            return matched_block_id, False
+
+        if matched_block_id and not is_new:
+            if last_active:
+                _pause(last_active['block_id'])
+            self.storage.update_bridge_block_status(matched_block_id, 'ACTIVE',
+                                                    session_id=session_id)
+            return matched_block_id, False
+
+        if last_active:
+            _pause(last_active['block_id'])
+
+        block_id = self.storage.create_new_bridge_block(
+            day_id=day_id, topic_label=suggested_label,
+            keywords=keywords, session_id=session_id
+        )
+        return block_id, True
+
+    def _build_block_index(self, session_id: str) -> List[Dict[str, Any]]:
+        """
+        Topic labels plus short summaries for this session.
+
+        Deliberately not the full blocks: a bridge block can be thousands of
+        tokens, so callers get an index and fetch a block on demand.
+        """
+        index = []
+        try:
+            for block in self.storage.get_active_bridge_blocks(session_id):
+                content = block.get('content', {})
+                summary = (content.get('summary') or '')[:200]
+                index.append({
+                    "block_id": block.get('block_id'),
+                    "topic_label": content.get('topic_label', 'Unknown'),
+                    "summary": summary,
+                    "status": block.get('status'),
+                })
+        except Exception as e:
+            logger.warning(f"Could not build block index: {e}")
+        return index
+
+    def _collect_open_loops(self, session_id: str) -> List[str]:
+        """Unresolved threads across this session's blocks."""
+        loops = []
+        try:
+            for block in self.storage.get_active_bridge_blocks(session_id):
+                for loop in block.get('content', {}).get('open_loops', []) or []:
+                    if loop and loop not in loops:
+                        loops.append(loop)
+        except Exception as e:
+            logger.warning(f"Could not collect open loops: {e}")
+        return loops
     
     def log_conversation_turn(self, user_msg: str, assistant_msg: str, session_id: str = "default_session",
                              keywords: List[str] = None, topics: List[str] = None, affect: str = None):
