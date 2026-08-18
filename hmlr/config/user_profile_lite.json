@@ -1,0 +1,16 @@
+{
+  "version": "1.0",
+  "last_updated": "2025-12-23T17:28:02.883622",
+  "glossary": {
+    "projects": [],
+    "entities": [],
+    "constraints": [
+      {
+        "key": "dietary_vegetarian",
+        "type": "Dietary",
+        "description": "User is strictly vegetarian, does not eat meat or fish",
+        "updated": "12/23/2025 17:28:00"
+      }
+    ]
+  }
+}
