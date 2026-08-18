@@ -685,15 +685,16 @@ class Storage:
     def update_facts_block_id(self, turn_id: str, block_id: str) -> int:
         return LedgerStore.link_facts_to_block(self.conn, turn_id, block_id)
     
-    def get_active_bridge_blocks(self) -> List[Dict[str, Any]]:
-        return LedgerStore.get_active_bridge_blocks(self.conn)
+    def get_active_bridge_blocks(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return LedgerStore.get_active_bridge_blocks(self.conn, session_id)
     
     # ========================================================================
     # BRIDGE BLOCK STORAGE METHODS
     # ========================================================================
 
-    def get_daily_ledger_metadata(self, day_id: str) -> List[Dict[str, Any]]:
-        return LedgerStore.get_daily_ledger_metadata(self.conn, day_id)
+    def get_daily_ledger_metadata(self, day_id: str,
+                                  session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return LedgerStore.get_daily_ledger_metadata(self.conn, day_id, session_id)
 
     def get_bridge_block_full(self, block_id: str) -> Optional[Dict[str, Any]]:
         return LedgerStore.get_bridge_block_full(self.conn, block_id)
@@ -719,9 +720,12 @@ class Storage:
         topic_label: str,
         keywords: List[str],
         span_id: Optional[str] = None,
+        session_id: str = "default_session",
         **kwargs
     ) -> Optional[str]:
-        return LedgerStore.create_new_bridge_block(self.conn, day_id, topic_label, keywords, span_id, **kwargs)
+        return LedgerStore.create_new_bridge_block(
+            self.conn, day_id, topic_label, keywords, span_id, session_id, **kwargs
+        )
 
     def update_bridge_block_metadata(self, block_id: str, metadata: Dict[str, Any]) -> bool:
         return LedgerStore.update_bridge_block_metadata(self.conn, block_id, metadata)

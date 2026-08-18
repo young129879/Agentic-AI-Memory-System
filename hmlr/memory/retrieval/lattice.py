@@ -148,7 +148,8 @@ class TheGovernor:
         self, 
         query: str, 
         day_id: str,
-        candidates: Optional[List[MemoryCandidate]] = None
+        candidates: Optional[List[MemoryCandidate]] = None,
+        session_id: Optional[str] = None
     ) -> Tuple[Dict[str, Any], List[MemoryCandidate], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
 
@@ -163,6 +164,9 @@ class TheGovernor:
             query: User query text
             day_id: Current day ID (e.g., "2025-01-15")
             candidates: Optional pre-fetched memory candidates (from retrieval layer)
+            session_id: Restrict routing, memory and facts to one conversation
+                session. Dossiers are deliberately left unscoped -- they
+                aggregate facts across sessions, which is their whole purpose.
         
         Returns:
             Tuple of (routing_decision, filtered_memories, facts, dossiers)
@@ -182,9 +186,9 @@ class TheGovernor:
         # Execute dossier retrieval if dossier_retriever is available
         if self.dossier_retriever:
             results = await asyncio.gather(
-                self._route_to_bridge_block(query, day_id),
-                self._retrieve_and_filter_memories(query, day_id, candidates),
-                loop.run_in_executor(None, self._lookup_facts, query),
+                self._route_to_bridge_block(query, day_id, session_id),
+                self._retrieve_and_filter_memories(query, day_id, candidates, session_id),
+                loop.run_in_executor(None, self._lookup_facts, query, session_id),
                 loop.run_in_executor(None, self._retrieve_dossiers, query),
                 return_exceptions=True
             )
@@ -192,9 +196,9 @@ class TheGovernor:
         else:
             # Fallback for systems without dossier_retriever
             results = await asyncio.gather(
-                self._route_to_bridge_block(query, day_id),
-                self._retrieve_and_filter_memories(query, day_id, candidates),
-                loop.run_in_executor(None, self._lookup_facts, query),
+                self._route_to_bridge_block(query, day_id, session_id),
+                self._retrieve_and_filter_memories(query, day_id, candidates, session_id),
+                loop.run_in_executor(None, self._lookup_facts, query, session_id),
                 return_exceptions=True
             )
             routing_decision, filtered_memories, facts = results
@@ -358,7 +362,8 @@ class TheGovernor:
 
         return routing_decision, new_memories, new_facts, dossiers
     
-    async def _route_to_bridge_block(self, query: str, day_id: str) -> Dict[str, Any]:
+    async def _route_to_bridge_block(self, query: str, day_id: str,
+                                     session_id: Optional[str] = None) -> Dict[str, Any]:
         """
         TASK 1: LLM-based Bridge Block routing (metadata only).
         
@@ -367,6 +372,8 @@ class TheGovernor:
         Args:
             query: User query text
             day_id: Current day ID
+            session_id: Only consider blocks belonging to this session, so a
+                query is never routed into another window's topic.
         
         Returns:
             {
@@ -379,7 +386,7 @@ class TheGovernor:
         # Tracer span removed - telemetry deleted
         
         # Get metadata for all active bridge blocks (excludes turns[])
-        metadata_list = self.storage.get_daily_ledger_metadata(day_id)
+        metadata_list = self.storage.get_daily_ledger_metadata(day_id, session_id)
         
         if not metadata_list:
             # No blocks exist today - this is the first query
@@ -562,7 +569,8 @@ Return JSON:
         self,
         query: str,
         day_id: str,
-        candidates: Optional[List[MemoryCandidate]] = None
+        candidates: Optional[List[MemoryCandidate]] = None,
+        session_id: Optional[str] = None
     ) -> List[MemoryCandidate]:
         """
         TASK 2: Memory retrieval + 2-key filtering (Vector similarity + LLM).
@@ -574,6 +582,7 @@ Return JSON:
         Args:
             query: User query text
             candidates: Optional pre-fetched candidates (if None, performs vector search)
+            session_id: Restrict the vector search to one conversation session.
         
         Returns:
             List of MemoryCandidate objects (filtered by LLM)
@@ -596,12 +605,13 @@ Return JSON:
                     raw_query=query
                 )
                 
-                # Retrieve contexts from crawler (this searches all embeddings)
+                # Retrieve contexts from crawler (scoped to this session)
                 retrieved_context = self.crawler.retrieve_context(
                     intent=intent,
                     current_day_id=day_id,
                     max_results=20,  # Get top 20 candidates for filtering
-                    window=None  # Search all time periods
+                    window=None,  # Search all time periods
+                    session_id=session_id
                 )
                 
                 logger.debug(f"Crawler found {len(retrieved_context.contexts)} candidates")
@@ -767,12 +777,14 @@ Return JSON:
             # Fail open: returning candidates is safer than returning nothing
             return candidates
     
-    def _lookup_facts(self, query: str) -> List[Dict[str, Any]]:
+    def _lookup_facts(self, query: str,
+                      session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         TASK 3: Fact store lookup (synchronous SQLite query).
         
         Args:
             query: User query text
+            session_id: Restrict facts to one conversation session.
         
         Returns:
             List of fact dictionaries from fact_store
@@ -786,7 +798,7 @@ Return JSON:
         facts = []
         for word in unique_words:
             # Try exact match (only method available)
-            fact = self.storage.query_fact_store(word)
+            fact = self.storage.query_fact_store(word, session_id)
             if fact and fact not in facts:
                 facts.append(fact)
         
@@ -796,6 +808,9 @@ Return JSON:
     def _retrieve_dossiers(self, query: str) -> List[Dict[str, Any]]:
         """
         TASK 4: Dossier retrieval (synchronous semantic search via embeddings).
+
+        Intentionally NOT session-scoped: a dossier's value is that it
+        aggregates facts across sessions and across time.
         
         Args:
             query: User query text
@@ -818,12 +833,14 @@ Return JSON:
         logger.info(f"Dossier retrieval: Found {len(dossiers)} relevant dossiers")
         return dossiers
     
-    def _check_fact_store(self, query: str) -> List[Dict[str, Any]]:
+    def _check_fact_store(self, query: str,
+                          session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Check fact_store for exact keyword matches
         
         Args:
             query: User query text
+            session_id: Restrict facts to one conversation session.
         
         Returns:
             List of matching facts (empty if none found)
@@ -837,18 +854,20 @@ Return JSON:
         results = []
         for word in unique_words:
             # Try exact match (only method available)
-            fact = self.storage.query_fact_store(word)
+            fact = self.storage.query_fact_store(word, session_id)
             if fact and fact not in results:
                 results.append(fact)
         
         return results
     
-    def _check_daily_ledger(self, query: str) -> List[Dict[str, Any]]:
+    def _check_daily_ledger(self, query: str,
+                            session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Check daily_ledger for same-day Bridge Blocks
         
         Args:
             query: User query text
+            session_id: Restrict blocks to one conversation session.
         
         Returns:
             List of Bridge Blocks from today (empty if none found)
@@ -856,7 +875,7 @@ Return JSON:
         # Tracer span removed - telemetry deleted
         
         # Get all active blocks (cross-day continuity)
-        today_blocks = self.storage.get_active_bridge_blocks()
+        today_blocks = self.storage.get_active_bridge_blocks(session_id)
         
         if not today_blocks:
             return []
