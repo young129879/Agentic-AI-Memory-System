@@ -164,6 +164,12 @@ def create_app(db_path: Optional[str] = None,
             content={"detail": "Internal memory service error", "error": str(exc)},
         )
 
+    # Read-only access to memory the model was told about but not given in
+    # full. Injection advertises these, so they mount unconditionally.
+    from .bridge import create_router as create_bridge_router
+
+    app.include_router(create_bridge_router(get_service))
+
     # Anthropic-compatible proxy. Mounted only when an upstream is configured,
     # so the service can also run as memory-only with no LLM credentials.
     resolved_upstream = upstream_url or os.getenv("HMLR_UPSTREAM_URL")
