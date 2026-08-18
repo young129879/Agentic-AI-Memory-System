@@ -505,13 +505,16 @@ If no facts found, return: {{"facts": []}}
         ))
         self.storage.conn.commit()
     
-    def query_facts(self, query: str, limit: int = 10) -> List[Fact]:
+    def query_facts(self, query: str, limit: int = 10,
+                    session_id: Optional[str] = None) -> List[Fact]:
         """
         Query fact_store for exact keyword matches.
         
         Args:
             query: Search query (e.g., "HMLR", "API_KEY")
             limit: Maximum number of results
+            session_id: Restrict to one conversation session.
+                None searches every session (pre-multi-session behaviour).
         
         Returns:
             List of matching Fact objects, sorted by recency
@@ -520,17 +523,31 @@ If no facts found, return: {{"facts": []}}
         """
         cursor = self.storage.conn.cursor()
         
-        # Case-insensitive search on key or value
-        cursor.execute("""
-            SELECT 
-                key, value, category, evidence_snippet,
-                source_chunk_id, source_paragraph_id, source_block_id, 
-                source_turn_id, source_span_id, created_at
-            FROM fact_store
-            WHERE key LIKE ? OR value LIKE ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (f"%{query}%", f"%{query}%", limit))
+        # Case-insensitive search on key or value.
+        # Without the session predicate a fact scrubbed from one agent window
+        # would surface verbatim in another.
+        if session_id:
+            cursor.execute("""
+                SELECT 
+                    key, value, category, evidence_snippet,
+                    source_chunk_id, source_paragraph_id, source_block_id, 
+                    source_turn_id, source_span_id, created_at
+                FROM fact_store
+                WHERE (key LIKE ? OR value LIKE ?) AND session_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (f"%{query}%", f"%{query}%", session_id, limit))
+        else:
+            cursor.execute("""
+                SELECT 
+                    key, value, category, evidence_snippet,
+                    source_chunk_id, source_paragraph_id, source_block_id, 
+                    source_turn_id, source_span_id, created_at
+                FROM fact_store
+                WHERE key LIKE ? OR value LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (f"%{query}%", f"%{query}%", limit))
         
         facts = []
         for row in cursor.fetchall():

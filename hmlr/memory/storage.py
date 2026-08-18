@@ -588,26 +588,40 @@ class Storage:
     # Fact Store & Daily Ledger Query Methods
     # ========================================================================
     
-    def query_fact_store(self, key: str) -> Optional[Dict[str, Any]]:
+    def query_fact_store(self, key: str,
+                         session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Query fact_store for exact keyword match 
         
         Args:
             key: The exact key to search for (e.g., "HMLR", "API_KEY")
+            session_id: Restrict to one conversation session.
+                None searches every session (pre-multi-session behaviour).
         
         Returns:
             Fact dictionary if found, None otherwise
         """
         cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT fact_id, key, value, category, 
-                   source_span_id, source_chunk_id, source_paragraph_id,
-                   source_block_id, source_turn_id, evidence_snippet, created_at
-            FROM fact_store
-            WHERE key = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-        """, (key,))
+        if session_id:
+            cursor.execute("""
+                SELECT fact_id, key, value, category, 
+                       source_span_id, source_chunk_id, source_paragraph_id,
+                       source_block_id, source_turn_id, evidence_snippet, created_at
+                FROM fact_store
+                WHERE key = ? AND session_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (key, session_id))
+        else:
+            cursor.execute("""
+                SELECT fact_id, key, value, category, 
+                       source_span_id, source_chunk_id, source_paragraph_id,
+                       source_block_id, source_turn_id, evidence_snippet, created_at
+                FROM fact_store
+                WHERE key = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (key,))
         
         row = cursor.fetchone()
         if not row:

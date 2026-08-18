@@ -32,18 +32,34 @@ class LedgerStore:
             return DEFAULT_SESSION_ID
 
     @staticmethod
-    def get_active_bridge_blocks(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    def get_active_bridge_blocks(
+        conn: sqlite3.Connection,
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Retrieve all active/paused Bridge Blocks.
         Note: Removed date filter - status='ACTIVE' is sufficient filter for current session blocks.
+
+        session_id restricts the result to one conversation session. Passing
+        None keeps the pre-multi-session behaviour of returning every block,
+        which maintenance tooling still relies on.
         """
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT block_id, content_json, created_at, status, exit_reason
-            FROM daily_ledger
-            WHERE status IN ('ACTIVE', 'PAUSED')
-            ORDER BY created_at DESC
-        """)
+        if session_id is None:
+            cursor.execute("""
+                SELECT block_id, content_json, created_at, status, exit_reason
+                FROM daily_ledger
+                WHERE status IN ('ACTIVE', 'PAUSED')
+                ORDER BY created_at DESC
+            """)
+        else:
+            cursor.execute("""
+                SELECT block_id, content_json, created_at, status, exit_reason
+                FROM daily_ledger
+                WHERE status IN ('ACTIVE', 'PAUSED')
+                  AND session_id = ?
+                ORDER BY created_at DESC
+            """, (session_id,))
         
         results = []
         for row in cursor.fetchall():
@@ -63,21 +79,37 @@ class LedgerStore:
         return results
 
     @staticmethod
-    def get_daily_ledger_metadata(conn: sqlite3.Connection, day_id: str) -> List[Dict[str, Any]]:
+    def get_daily_ledger_metadata(
+        conn: sqlite3.Connection,
+        day_id: str,
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Get metadata summaries of all Bridge Blocks for a specific day.
         Uses a join to ledger_turns for accurate turn counts.
         """
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT l.block_id, l.content_json, l.updated_at, l.status, COUNT(t.turn_id) as turn_count
-            FROM daily_ledger l
-            LEFT JOIN ledger_turns t ON l.block_id = t.block_id
-            WHERE DATE(l.created_at) = DATE(?)
-            AND l.status IN ('ACTIVE', 'PAUSED')
-            GROUP BY l.block_id
-            ORDER BY l.updated_at DESC
-        """, (day_id,))
+        if session_id is None:
+            cursor.execute("""
+                SELECT l.block_id, l.content_json, l.updated_at, l.status, COUNT(t.turn_id) as turn_count
+                FROM daily_ledger l
+                LEFT JOIN ledger_turns t ON l.block_id = t.block_id
+                WHERE DATE(l.created_at) = DATE(?)
+                AND l.status IN ('ACTIVE', 'PAUSED')
+                GROUP BY l.block_id
+                ORDER BY l.updated_at DESC
+            """, (day_id,))
+        else:
+            cursor.execute("""
+                SELECT l.block_id, l.content_json, l.updated_at, l.status, COUNT(t.turn_id) as turn_count
+                FROM daily_ledger l
+                LEFT JOIN ledger_turns t ON l.block_id = t.block_id
+                WHERE DATE(l.created_at) = DATE(?)
+                AND l.status IN ('ACTIVE', 'PAUSED')
+                AND l.session_id = ?
+                GROUP BY l.block_id
+                ORDER BY l.updated_at DESC
+            """, (day_id, session_id))
         
         metadata_list = []
         for row in cursor.fetchall():

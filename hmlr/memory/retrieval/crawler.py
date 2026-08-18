@@ -70,7 +70,8 @@ class LatticeCrawler:
         self,
         query: str,
         top_k: int = 20,
-        min_similarity: float = 0.55
+        min_similarity: float = 0.55,
+        session_id: Optional[str] = None
     ) -> List[Dict]:
         """
        
@@ -78,6 +79,8 @@ class LatticeCrawler:
             query: Query text to embed and search
             top_k: Number of chunks to retrieve
             min_similarity: Minimum similarity threshold (0.0-1.0)
+            session_id: Restrict results to one conversation session.
+                None searches every session (pre-multi-session behaviour).
             
         Returns:
             List of dicts with chunk_id, chunk_type, text_content, parent_id, 
@@ -89,10 +92,15 @@ class LatticeCrawler:
         print(f"    Searching gardened memory: '{query[:60]}...'")
         
         try:
+            # Vector search cannot filter by session, so over-fetch and drop
+            # foreign-session chunks below. Without this the candidate pool
+            # would be diluted by other sessions and could return nothing.
+            fetch_k = top_k * 5 if session_id else top_k
+
             # Search using embedding manager (now searches gardened_memory too)
             results = self.embedding_storage.search_similar(
                 query=query,
-                top_k=top_k,
+                top_k=fetch_k,
                 min_similarity=min_similarity or model_config.MIN_SIMILARITY_THRESHOLD
             )
         except Exception as e:
@@ -103,6 +111,9 @@ class LatticeCrawler:
         gardened_results = []
         
         for result in results:
+            if session_id and len(gardened_results) >= top_k:
+                break
+
             chunk_id = result.get('turn_id')  # EmbeddingStorage uses 'turn_id' field
             
             # Only process if it's a gardened chunk (starts with 'sent_' or 'para_')
@@ -110,13 +121,22 @@ class LatticeCrawler:
                 continue
             
             try:
-                # Get full chunk data from gardened_memory table
+                # Get full chunk data from gardened_memory table.
+                # The session predicate is what actually enforces isolation:
+                # a chunk owned by another session simply yields no row.
                 cursor = self.storage.conn.cursor()
-                cursor.execute("""
-                    SELECT chunk_id, chunk_type, text_content, parent_id, global_tags, block_id
-                    FROM gardened_memory
-                    WHERE chunk_id = ?
-                """, (chunk_id,))
+                if session_id:
+                    cursor.execute("""
+                        SELECT chunk_id, chunk_type, text_content, parent_id, global_tags, block_id
+                        FROM gardened_memory
+                        WHERE chunk_id = ? AND session_id = ?
+                    """, (chunk_id, session_id))
+                else:
+                    cursor.execute("""
+                        SELECT chunk_id, chunk_type, text_content, parent_id, global_tags, block_id
+                        FROM gardened_memory
+                        WHERE chunk_id = ?
+                    """, (chunk_id,))
                 
                 chunk_row = cursor.fetchone()
                 if not chunk_row:
@@ -171,11 +191,12 @@ class LatticeCrawler:
         self,
         query: str,
         top_k: int = 20,
-        min_similarity: float = 0.55
+        min_similarity: float = 0.55,
+        session_id: Optional[str] = None
     ) -> List[Dict]:
        
         # Delegate to new gardened memory search
-        return self._search_gardened_memory(query, top_k, min_similarity)
+        return self._search_gardened_memory(query, top_k, min_similarity, session_id)
     
  
     def retrieve_context(
@@ -183,7 +204,8 @@ class LatticeCrawler:
         intent: Intent,
         current_day_id: str,
         max_results: int = 10,
-        window: Optional[SlidingWindow] = None
+        window: Optional[SlidingWindow] = None,
+        session_id: Optional[str] = None
     ) -> RetrievedContext:
         
         #Main retrieval method - searches memory and returns structured context.
@@ -211,7 +233,8 @@ class LatticeCrawler:
             gardened_results = self._search_with_vectors(
                 query=search_query,
                 top_k=max_results * 2,  # Get more candidates for filtering
-                min_similarity=model_config.MIN_SIMILARITY_THRESHOLD
+                min_similarity=model_config.MIN_SIMILARITY_THRESHOLD,
+                session_id=session_id
             )
             # print(f"    Search query: '{search_query}'")
         
