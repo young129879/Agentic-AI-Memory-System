@@ -705,8 +705,12 @@ class Storage:
     def append_turn_to_block(self, block_id: str, turn: Dict[str, Any], **kwargs) -> bool:
         return LedgerStore.append_turn_to_block(self.conn, block_id, turn, **kwargs)
 
-    def update_bridge_block_status(self, block_id: str, new_status: str, exit_reason: Optional[str] = None) -> bool:
-        return LedgerStore.update_bridge_block_status(self.conn, block_id, new_status, exit_reason)
+    def update_bridge_block_status(self, block_id: str, new_status: str,
+                                   exit_reason: Optional[str] = None,
+                                   session_id: Optional[str] = None) -> bool:
+        return LedgerStore.update_bridge_block_status(
+            self.conn, block_id, new_status, exit_reason, session_id
+        )
 
     def update_last_active_flag(self, block_id: str) -> bool:
         return LedgerStore.update_last_active_flag(self.conn, block_id)

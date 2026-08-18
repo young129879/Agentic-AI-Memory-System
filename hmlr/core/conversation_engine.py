@@ -244,7 +244,9 @@ class ConversationEngine:
             
             # Call async govern() method
             try:
-                routing_decision, filtered_memories, facts, dossiers = await self.governor.govern(user_query, day_id)
+                routing_decision, filtered_memories, facts, dossiers = await self.governor.govern(
+                    user_query, day_id, session_id=session_id
+                )
             except RetrievalError as e:
                 logger.error(f"Critical retrieval failure: {e}. Proceeding with memory disabled.")
                 # Fallback: No memory, default routing
@@ -266,8 +268,10 @@ class ConversationEngine:
             is_new = routing_decision.get('is_new_topic', False)
             suggested_label = routing_decision.get('suggested_label', 'General Discussion')
             
-            # Get last active block (should be only one with status='ACTIVE')
-            active_blocks = self.storage.get_active_bridge_blocks()
+            # Get last active block for THIS session (should be only one with status='ACTIVE').
+            # Scoping matters here: without it a concurrent window's block would
+            # be picked up as "last active" and then paused or written into.
+            active_blocks = self.storage.get_active_bridge_blocks(session_id)
             last_active_block = None
             for block in active_blocks:
                 if block.get('status') == 'ACTIVE':
@@ -290,11 +294,11 @@ class ConversationEngine:
                 if last_active_block:
                     old_active_id = last_active_block['block_id']
                     logger.debug(f"Pausing old block: {old_active_id}")
-                    self.storage.update_bridge_block_status(old_active_id, 'PAUSED')
+                    self.storage.update_bridge_block_status(old_active_id, 'PAUSED', session_id=session_id)
                     self.storage.generate_block_summary(old_active_id)
                 
                 # Reactivate matched block
-                self.storage.update_bridge_block_status(matched_block_id, 'ACTIVE')
+                self.storage.update_bridge_block_status(matched_block_id, 'ACTIVE', session_id=session_id)
                 block_id = matched_block_id
                 is_new_topic = False
                 
@@ -309,7 +313,8 @@ class ConversationEngine:
                 block_id = self.storage.create_new_bridge_block(
                     day_id=day_id,
                     topic_label=suggested_label,
-                    keywords=keywords
+                    keywords=keywords,
+                    session_id=session_id
                 )
                 logger.debug(f"Created block: {block_id}")
                 is_new_topic = True
@@ -322,7 +327,7 @@ class ConversationEngine:
                 # Pause current active block
                 old_active_id = last_active_block['block_id']
                 logger.debug(f"Pausing old block: {old_active_id}")
-                self.storage.update_bridge_block_status(old_active_id, 'PAUSED')
+                self.storage.update_bridge_block_status(old_active_id, 'PAUSED', session_id=session_id)
                 self.storage.generate_block_summary(old_active_id)
                 
                 # Extract keywords from query
@@ -332,7 +337,8 @@ class ConversationEngine:
                 block_id = self.storage.create_new_bridge_block(
                     day_id=day_id,
                     topic_label=suggested_label,
-                    keywords=keywords
+                    keywords=keywords,
+                    session_id=session_id
                 )
                 logger.debug(f"Created block: {block_id}")
                 is_new_topic = True
@@ -344,7 +350,8 @@ class ConversationEngine:
                 block_id = self.storage.create_new_bridge_block(
                     day_id=day_id,
                     topic_label=suggested_label,
-                    keywords=keywords
+                    keywords=keywords,
+                    session_id=session_id
                 )
                 is_new_topic = True
             

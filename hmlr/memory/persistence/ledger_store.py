@@ -314,13 +314,29 @@ class LedgerStore:
             return False
 
     @staticmethod
-    def update_bridge_block_status(conn: sqlite3.Connection, block_id: str, new_status: str, exit_reason: Optional[str] = None) -> bool:
+    def update_bridge_block_status(conn: sqlite3.Connection, block_id: str, new_status: str,
+                                   exit_reason: Optional[str] = None,
+                                   session_id: Optional[str] = None) -> bool:
         """
         Change Bridge Block status between ACTIVE ↔ PAUSED.
+
+        block_id normally originates from an LLM routing decision, so when
+        session_id is supplied it is verified against the block's owner. A
+        hallucinated id belonging to another session is refused rather than
+        silently flipping that session's state.
         """
         if new_status not in ['ACTIVE', 'PAUSED', 'ARCHIVED']:
             logger.error(f"Invalid status: {new_status}")
             return False
+
+        if session_id is not None:
+            owner = LedgerStore._session_for_block(conn, block_id)
+            if owner != session_id:
+                logger.warning(
+                    f"Refusing status change on block {block_id}: "
+                    f"owned by session {owner}, requested by {session_id}"
+                )
+                return False
             
         cursor = conn.cursor()
         cursor.execute("SELECT content_json FROM daily_ledger WHERE block_id = ?", (block_id,))
