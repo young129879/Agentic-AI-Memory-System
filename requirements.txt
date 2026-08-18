@@ -10,6 +10,10 @@ sentence-transformers>=2.2.0
 torch>=2.0.0
 transformers>=4.30.0
 
+# ANN index. Optional: without it search falls back to a cached numpy
+# matmul, which is correct but scans every vector.
+sqlite-vec>=0.1.6
+
 # Database & Storage  
 # sqlite3 is built-in to Python (no install needed)
 

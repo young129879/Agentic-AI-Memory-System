@@ -8,8 +8,12 @@ Model: all-MiniLM-L6-v2 (384 dimensions, fast, good quality)
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
+import logging
+import os
 import pickle
 from hmlr.core.model_config import model_config
+
+logger = logging.getLogger(__name__)
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -225,6 +229,19 @@ class EmbeddingStorage:
             ))
         
         self.storage.conn.commit()
+
+        # Without this the index keeps serving its previous snapshot and the
+        # turn just written is invisible to search.
+        index = getattr(self.storage, "_vector_index", None)
+        if index is not None:
+            try:
+                for idx, chunk_text in enumerate(chunks):
+                    index.add(f"{turn_id}_chunk_{idx}",
+                              self.embedding_manager.encode(chunk_text),
+                              session_id)
+            except Exception as e:
+                logger.debug(f"Could not update vector index: {e}")
+
         return len(chunks)
     
     def get_all_embeddings(self) -> List[Tuple[str, np.ndarray, str, str]]:
@@ -256,7 +273,8 @@ class EmbeddingStorage:
         return results
     
     def search_similar(self, query: str, top_k: int = 10, 
-                      min_similarity: float = 0.55) -> List[Dict]:
+                      min_similarity: float = 0.55,
+                      session_id: str = None) -> List[Dict]:
         """
         Search for similar conversations using vector similarity.
         ONLY searches gardened_memory (long-term storage), not embeddings table (query vectors).
@@ -265,35 +283,79 @@ class EmbeddingStorage:
             query: Search query
             top_k: Number of results
             min_similarity: Minimum similarity threshold
+            session_id: Restrict to one conversation session
             
         Returns:
             List of results with turn_id (chunk_id), similarity, text
         """
-        # Encode query
         query_embedding = self.embedding_manager.encode(query)
-        
-        # ONLY load embeddings from gardened_memory (long-term searchable content)
-        # The embeddings table contains query vectors, not searchable content
-        gardened_embeddings = self._get_gardened_embeddings()
-        
-        if not gardened_embeddings:
+
+        index = self._get_index()
+        if index is None:
             return []
-        
-        # Find similar
-        similar = self.embedding_manager.find_similar(
-            query_embedding,
-            [(e[0], e[1], e[2]) for e in gardened_embeddings],
-            top_k=top_k,
-            min_similarity=min_similarity
-        )
-        
-        # Add chunk_id to results (stored as turn_id for backward compatibility)
-        embedding_to_chunk = {e[0]: e[3] for e in gardened_embeddings}
-        for result in similar:
-            result['turn_id'] = embedding_to_chunk[result['embedding_id']]  # This is actually chunk_id
-            result['query_vector'] = query_embedding
-        
-        return similar
+
+        hits = index.search(query_embedding, top_k=top_k,
+                            min_similarity=min_similarity,
+                            session_id=session_id)
+        if not hits:
+            return []
+
+        # Text is fetched only for the chunks that survived ranking, rather
+        # than loaded for every stored chunk up front.
+        placeholders = ",".join("?" * len(hits))
+        rows = self.storage.conn.execute(
+            f"SELECT chunk_id, text_content FROM gardened_memory "
+            f"WHERE chunk_id IN ({placeholders})",
+            [c for c, _ in hits],
+        ).fetchall()
+        texts = {r[0]: r[1] for r in rows}
+
+        return [{
+            "embedding_id": chunk_id,
+            "turn_id": chunk_id,          # historical name for chunk_id
+            "chunk_id": chunk_id,
+            "similarity": similarity,
+            "text": texts.get(chunk_id, ""),
+            "query_vector": query_embedding,
+        } for chunk_id, similarity in hits if chunk_id in texts]
+
+    def _get_index(self):
+        """
+        Lazily build the vector index, sharing one instance per storage.
+
+        Built on first search rather than at construction so that importing
+        or instantiating storage never touches the index.
+        """
+        index = getattr(self.storage, "_vector_index", None)
+        if index is not None:
+            return index
+
+        try:
+            from .vector_index import create_index
+            index = create_index(
+                self.storage.conn,
+                dimension=self.embedding_manager.dimension,
+                prefer=os.getenv("HMLR_VECTOR_BACKEND", "auto"),
+            )
+            index.rebuild()
+            self.storage._vector_index = index
+            return index
+        except Exception as e:
+            logger.error(f"Vector index unavailable: {e}", exc_info=True)
+            return None
+
+    def invalidate_index(self, chunk_id: str = None) -> None:
+        """Tell the index that stored vectors changed."""
+        index = getattr(self.storage, "_vector_index", None)
+        if index is None:
+            return
+        try:
+            if chunk_id:
+                index.add(chunk_id, np.zeros(1, dtype=np.float32), "")
+            else:
+                index.rebuild()
+        except Exception as e:
+            logger.debug(f"Index invalidation failed: {e}")
     
     def _get_gardened_embeddings(self) -> List[Tuple[str, np.ndarray, str, str]]:
         """

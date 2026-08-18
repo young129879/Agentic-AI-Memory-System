@@ -92,16 +92,14 @@ class LatticeCrawler:
         print(f"    Searching gardened memory: '{query[:60]}...'")
         
         try:
-            # Vector search cannot filter by session, so over-fetch and drop
-            # foreign-session chunks below. Without this the candidate pool
-            # would be diluted by other sessions and could return nothing.
-            fetch_k = top_k * 5 if session_id else top_k
-
-            # Search using embedding manager (now searches gardened_memory too)
+            # The index filters by session itself, so no over-fetching is
+            # needed here; the gardened_memory predicate below is kept as a
+            # second check rather than as the mechanism.
             results = self.embedding_storage.search_similar(
                 query=query,
-                top_k=fetch_k,
-                min_similarity=min_similarity or model_config.MIN_SIMILARITY_THRESHOLD
+                top_k=top_k,
+                min_similarity=min_similarity or model_config.MIN_SIMILARITY_THRESHOLD,
+                session_id=session_id,
             )
         except Exception as e:
             logger.error(f"Vector database search failed: {e}", exc_info=True)
