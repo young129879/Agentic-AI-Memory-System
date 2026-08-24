@@ -86,3 +86,7 @@ class HealthResponse(BaseModel):
                     "A low rate means the upstream prompt prefix is changing "
                     "between turns and prompt caching is being defeated.",
     )
+    auto_gardener: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Status of the automatic idle-block archiver.",
+    )

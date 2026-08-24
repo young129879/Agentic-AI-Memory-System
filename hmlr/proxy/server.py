@@ -41,11 +41,54 @@ class MemoryService:
     def __init__(self, db_path: Optional[str] = None,
                  api_key: Optional[str] = None,
                  context_ttl: int = 3600,
-                 injection_cache=None):
+                 injection_cache=None,
+                 auto_gardener=None):
         self.client = HMLRClient(api_key=api_key, db_path=db_path)
         self.contexts = ContextStore(ttl_seconds=context_ttl)
         self.injection = injection_cache
+        self.auto_gardener = auto_gardener
         logger.info(f"Memory service ready (db={self.client.db_path})")
+
+    def start_background(self) -> None:
+        """Start non-blocking background workers (automatic gardening)."""
+        if self.auto_gardener is not None:
+            self.auto_gardener.start()
+
+    async def stop_background(self) -> None:
+        """Stop background workers gracefully."""
+        if self.auto_gardener is not None:
+            await self.auto_gardener.stop()
+
+
+def _make_gardener(service: "MemoryService", inactive_days: int,
+                   interval_hours: float):
+    """
+    Build an AutoGardener over the client's components, or None when the
+    necessary pieces are unavailable (e.g. no LLM client configured).
+
+    A failure here must not block service startup; it only disables automatic
+    gardening for this process.
+    """
+    components = getattr(service.client, "components", None)
+    if components is None:
+        logger.warning("AutoGardener disabled: client has no components")
+        return None
+    try:
+        gardener = components.gardener
+        if gardener is None:
+            logger.warning("AutoGardener disabled: no gardener component")
+            return None
+        from .auto_gardener import AutoGardener
+        return AutoGardener(
+            components.storage,
+            gardener,
+            interval_hours=interval_hours,
+            inactive_days=inactive_days,
+            enabled=True,
+        )
+    except Exception as e:
+        logger.error(f"AutoGardener init failed: {e}", exc_info=True)
+        return None
 
 
 def create_app(db_path: Optional[str] = None,
@@ -56,7 +99,9 @@ def create_app(db_path: Optional[str] = None,
                openai_upstream_url: Optional[str] = None,
                openai_upstream_key: Optional[str] = None,
                bridge_url: Optional[str] = None,
-               injection_ttl: int = 7200) -> FastAPI:
+               injection_ttl: int = 7200,
+               gardener_inactive_days: Optional[int] = None,
+               gardener_interval_hours: Optional[float] = None) -> FastAPI:
 
     service: dict = {}
 
@@ -69,15 +114,25 @@ def create_app(db_path: Optional[str] = None,
     async def lifespan(app: FastAPI):
         # Built here rather than at import time so that loading this module
         # never triggers model downloads or database creation.
-        service["instance"] = MemoryService(
+        inactive = int(os.getenv("HMLR_GARDENER_INACTIVE_DAYS", 30)) \
+            if gardener_inactive_days is None else int(gardener_inactive_days)
+        interval = float(os.getenv("HMLR_GARDENER_INTERVAL_HOURS", 24)) \
+            if gardener_interval_hours is None else float(gardener_interval_hours)
+
+        instance = MemoryService(
             db_path=db_path or os.getenv("HMLR_DB_PATH"),
             api_key=api_key,
             context_ttl=context_ttl,
             injection_cache=injection_cache,
         )
+        if os.getenv("HMLR_GARDENER_ENABLED", "1").lower() not in ("0", "false", "no"):
+            instance.auto_gardener = _make_gardener(instance, inactive, interval)
+        instance.start_background()
+        service["instance"] = instance
         yield
         # Streamed turns are persisted after the response is delivered, so a
         # write can still be in flight when shutdown begins.
+        await instance.stop_background()
         from .llm_handler import flush_pending_writes
         flushed = await flush_pending_writes(timeout=10.0)
         if flushed:
@@ -102,12 +157,22 @@ def create_app(db_path: Optional[str] = None,
         instance = service.get("instance")
         if instance is None:
             return HealthResponse(status="starting", version=VERSION)
+        gardener = None
+        if instance.auto_gardener is not None:
+            gardener = {
+                "enabled": instance.auto_gardener.enabled,
+                "inactive_days": instance.auto_gardener.inactive_days,
+                "interval_hours": instance.auto_gardener.interval_hours,
+                "sweeps": instance.auto_gardener.sweep_count,
+                "last": instance.auto_gardener.last_sweep_result,
+            }
         return HealthResponse(
             status="ok",
             version=VERSION,
             db_path=str(instance.client.db_path),
             sessions_cached=len(instance.contexts),
             injection_cache=injection_cache.stats(),
+            auto_gardener=gardener,
         )
 
     @app.post("/memory/recall", response_model=RecallResponse)
