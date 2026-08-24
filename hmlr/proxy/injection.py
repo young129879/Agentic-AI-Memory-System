@@ -93,6 +93,14 @@ def _render_loops(loops: List[str], budget: int) -> str:
 
 
 def _render_index(index: List[Dict[str, Any]], budget: int) -> str:
+    """
+    Topic index for the session.
+
+    Every block gets its label and summary; related blocks (the ones the
+    memory search surfaced) additionally carry their open loops and key
+    decisions, so a multi-block topic shares its signal with the prompt even
+    though only the routed block's full text is injected.
+    """
     if not index:
         return ""
     lines, used = [], 0
@@ -100,7 +108,14 @@ def _render_index(index: List[Dict[str, Any]], budget: int) -> str:
         label = entry.get("topic_label", "Unknown")
         summary = _truncate(entry.get("summary") or "", 200)
         block_id = entry.get("block_id") or ""
-        line = f"- [{block_id}] {label}" + (f" - {summary}" if summary else "")
+        marker = " [related]" if entry.get("related") else ""
+        line = f"- [{block_id}]{marker} {label}" + (f" - {summary}" if summary else "")
+        extra = []
+        for key in ("open_loops", "decisions"):
+            for item in entry.get(key) or []:
+                extra.append(f"{key}= {item}")
+        if extra:
+            line += " (" + "; ".join(extra) + ")"
         if used + len(line) > budget:
             break
         lines.append(line)

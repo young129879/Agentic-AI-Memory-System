@@ -584,7 +584,22 @@ class ConversationEngine:
             if block_id:
                 result.block_facts = self.storage.get_facts_for_block(block_id)
 
-            result.block_index = self._build_block_index(session_id)
+            # Related blocks = every other block the memory search surfaced.
+            # Marking them in the index lets the prompt show their facts too,
+            # without reading their full text. This is the "read the related
+            # topics" behaviour, done cheaply.
+            related = set()
+            for mem in memories:
+                bid = getattr(mem, "block_id", None)
+                if bid is None:
+                    fo = getattr(mem, "full_object", None)
+                    if isinstance(fo, dict):
+                        bid = fo.get("block_id")
+                if bid and bid != block_id:
+                    related.add(bid)
+
+            result.block_index = self._build_block_index(session_id,
+                                                         related_block_ids=related)
             result.open_loops = self._collect_open_loops(session_id)
 
             return result
@@ -682,24 +697,40 @@ class ConversationEngine:
         )
         return block_id, True
 
-    def _build_block_index(self, session_id: str) -> List[Dict[str, Any]]:
+    def _build_block_index(self, session_id: str,
+                           related_block_ids: Optional[set] = None) -> List[Dict[str, Any]]:
         """
         Topic labels plus short summaries for this session.
 
         Deliberately not the full blocks: a bridge block can be thousands of
         tokens, so callers get an index and fetch a block on demand.
+
+        Each entry also carries up to a few open_loops and decisions, so that
+        the *signal* of every related block reaches the prompt even when only
+        the routed block's full text is injected. This is how many blocks of
+        the same topic share their key facts without the token cost of
+        reading them all.
         """
         index = []
         try:
             for block in self.storage.get_active_bridge_blocks(session_id):
                 content = block.get('content', {})
                 summary = (content.get('summary') or '')[:200]
-                index.append({
+                entry = {
                     "block_id": block.get('block_id'),
                     "topic_label": content.get('topic_label', 'Unknown'),
                     "summary": summary,
                     "status": block.get('status'),
-                })
+                }
+                if related_block_ids:
+                    entry["related"] = block.get('block_id') in related_block_ids
+                loops = content.get('open_loops') or []
+                decisions = content.get('decisions_made') or []
+                if loops:
+                    entry["open_loops"] = list(loops)[:3]
+                if decisions:
+                    entry["decisions"] = list(decisions)[:3]
+                index.append(entry)
         except Exception as e:
             logger.warning(f"Could not build block index: {e}")
         return index
